@@ -1,7 +1,9 @@
 /* USER CODE BEGIN Header */
 /**
   * @file main.c
-  * @brief Simple polygon loop: Advance (encoders) -> Pause -> Turn (time) -> Pause.
+  * @brief Polygon loop with multiple laps:
+  *        Advance (encoders) -> Pause -> Turn (time, scaled by angle) -> Pause.
+  *        Turn angle per corner = 360 / sides (triangle 120°, square 90°, ...).
   */
 /* USER CODE END Header */
 #include "main.h"
@@ -17,15 +19,33 @@
 /* Parámetros calibrados */
 #define DIST_CAL_FACTOR                    1.33f
 #define PWM_AVANCE_PCT                     35.0f
-#define TURN_PWM_PERCENT                   25.0f
+#define TURN_PWM_PERCENT                   23.0f
 
-#define DEFAULT_POLYGON_SIDES              4U
-#define DEFAULT_SIDE_LENGTH_CM            15.0f
-#define DEFAULT_TURN_DIRECTION             1    /* +1 left, -1 right */
-#define AUTO_RUN_AT_BOOT                   1U   /* 1: run once after startup */
+/* Polygon configuration */
+#define DEFAULT_POLYGON_SIDES              3U     /* 3 = triangle, 4 = square, ... */
+#define DEFAULT_SIDE_LENGTH_CM            30.0f
+#define DEFAULT_LAPS                       2U     /* Number of complete laps     */
+#define DEFAULT_TURN_DIRECTION             1      /* +1 left, -1 right           */
+#define AUTO_RUN_AT_BOOT                   1U     /* 1: run once after startup   */
 
-/* TIEMPO EXACTO DE GIRO PARA 90° (Ajusta este valor si le falta o se pasa) */
+/* ---------------- Turn calibration ----------------
+ * TURN_DURATION_90_MS: measured time for an exact 90° turn (already calibrated).
+ * TURN_OFFSET_MS: fixed spin-up time of the motors (start with 0).
+ *
+ * Turn time model:
+ *   turn_ms = TURN_OFFSET_MS + (TURN_DURATION_90_MS - TURN_OFFSET_MS) * angle / 90
+ *
+ * With TURN_OFFSET_MS = 0, the time is simply proportional to the angle.
+ * 90° always stays exactly TURN_DURATION_90_MS, so your square keeps working.
+ * For quick tuning of the triangle, use TURN_EXTRA_TRIM_MS below instead.
+ */
 #define TURN_DURATION_90_MS                650U
+#define TURN_OFFSET_MS                     0U
+
+/* Simple extra trim applied to every NON-90° turn (in ms).
+ * If the triangle's 120° turns fall short, use a positive value (e.g. 20).
+ * If they overshoot, use a negative value (e.g. -20).                       */
+#define TURN_EXTRA_TRIM_MS                 20
 
 #define CM_PER_PULSE (DIST_CAL_FACTOR * PI_F * WHEEL_DIAMETER_CM / \
                      (float)ENCODER_PULSES_PER_WHEEL_REV)
@@ -48,6 +68,7 @@
 #define ENCODER_STALL_TIMEOUT_MS            1200U
 #define PAUSE_AFTER_ADVANCE_MS             1500U
 #define PAUSE_AFTER_TURN_MS                1500U
+#define PAUSE_BEFORE_TURN_MS                100U
 #define STARTUP_DELAY_MS                   2000U
 
 typedef struct {
@@ -67,10 +88,11 @@ TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 
-volatile uint8_t polygon_sides = DEFAULT_POLYGON_SIDES;
-volatile float polygon_side_cm = DEFAULT_SIDE_LENGTH_CM;
-volatile int8_t polygon_turn_direction = DEFAULT_TURN_DIRECTION;
-volatile uint8_t run_request = 0U;
+volatile uint8_t polygon_sides          = DEFAULT_POLYGON_SIDES;
+volatile float   polygon_side_cm        = DEFAULT_SIDE_LENGTH_CM;
+volatile uint8_t polygon_laps           = DEFAULT_LAPS;
+volatile int8_t  polygon_turn_direction = DEFAULT_TURN_DIRECTION;
+volatile uint8_t run_request            = 0U;
 
 static const Motor_t motorA = { AIN1_GPIO_Port, AIN1_Pin, AIN2_GPIO_Port, AIN2_Pin, PWM_CH_A };
 static const Motor_t motorB = { BIN1_GPIO_Port, BIN1_Pin, BIN2_GPIO_Port, BIN2_Pin, PWM_CH_B };
@@ -99,11 +121,15 @@ static void Motor_Brake(void);
 static void Encoder_Reset(void);
 static void Encoder_Snapshot(uint32_t *left, uint32_t *right);
 static void Drive_Straight(float distance_cm);
-static void Turn_Once(int8_t direction);
+static uint32_t Turn_TimeForAngle(float angle_deg);
+static void Turn_Angle(int8_t direction, float angle_deg);
+static void Polygon_Run(uint8_t sides, uint8_t laps, float side_cm, int8_t direction);
 static float AbsF(float x);
 static float ClampF(float x, float lo, float hi);
 
+/* ================= Helpers ================= */
 static float AbsF(float x) { return (x < 0.0f) ? -x : x; }
+
 static float ClampF(float x, float lo, float hi)
 {
     if (x < lo) return lo;
@@ -111,6 +137,7 @@ static float ClampF(float x, float lo, float hi)
     return x;
 }
 
+/* ================= Motors ================= */
 static void Motor_Drive(const Motor_t *motor, float percent)
 {
     percent = ClampF(percent, -100.0f, 100.0f);
@@ -159,6 +186,7 @@ static void Motors_Init(void)
     HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_SET);
 }
 
+/* ================= Encoders ================= */
 static void Encoders_Init(void)
 {
     __HAL_TIM_SET_AUTORELOAD(&htim2, ENC_ARR);
@@ -186,13 +214,12 @@ static void Encoder_Snapshot(uint32_t *left, uint32_t *right)
     if (primask == 0U) __enable_irq();
 }
 
-/* ================= AVANCE RECTO (Exactamente el que te funcionó) ================= */
+/* ================= AVANCE RECTO (unchanged, the version that works) ================= */
 static void Drive_Straight(float distance_cm)
 {
     Encoder_Reset();
     uint32_t left_start, right_start;
     Encoder_Snapshot(&left_start, &right_start);
-    uint32_t target_pulses = (uint32_t)(distance_cm / CM_PER_PULSE + 0.99999f);
     float measured_progress_cm = 0.0f;
 
     uint32_t start_ms = HAL_GetTick();
@@ -211,7 +238,7 @@ static void Drive_Straight(float distance_cm)
         uint32_t right_delta = right_now - right_start;
         measured_progress_cm = 0.5f * (float)(left_delta + right_delta) * CM_PER_PULSE;
 
-        if (left_now != prev_left) { prev_left = left_now; last_left_ms = now; }
+        if (left_now != prev_left)   { prev_left = left_now;   last_left_ms = now; }
         if (right_now != prev_right) { prev_right = right_now; last_right_ms = now; }
 
         if ((now - last_left_ms) >= ENCODER_STALL_TIMEOUT_MS ||
@@ -230,42 +257,69 @@ static void Drive_Straight(float distance_cm)
     HAL_Delay(PAUSE_AFTER_ADVANCE_MS); /* Pausa visible al terminar de avanzar */
 }
 
-/* ================= GIRO DE 90° (Por tiempo calibrado y limpio) ================= */
-static void Turn_Once(int8_t direction)
+/* ================= GIRO POR ÁNGULO (tiempo escalado desde la calibración de 90°) ================= */
+static uint32_t Turn_TimeForAngle(float angle_deg)
 {
-    Motor_Brake();
-    HAL_Delay(100U);
+    const float offset   = (float)TURN_OFFSET_MS;
+    const float per_90   = (float)TURN_DURATION_90_MS - offset;
+    float ms = offset + per_90 * (angle_deg / 90.0f);
 
-    if (direction > 0) {
-        Motor_Set(-TURN_PWM_PERCENT, TURN_PWM_PERCENT); /* Izquierda */
-    } else {
-        Motor_Set(TURN_PWM_PERCENT, -TURN_PWM_PERCENT); /* Derecha */
+    /* Extra trim only for angles different from 90° (keeps the square intact) */
+    if (AbsF(angle_deg - 90.0f) > 0.5f) {
+        ms += (float)TURN_EXTRA_TRIM_MS;
     }
 
-    HAL_Delay(TURN_DURATION_90_MS); /* Duración exacta del giro de 90° */
+    if (ms < 0.0f) ms = 0.0f;
+    return (uint32_t)(ms + 0.5f);
+}
+
+static void Turn_Angle(int8_t direction, float angle_deg)
+{
+    uint32_t turn_ms = Turn_TimeForAngle(angle_deg);
+
+    Motor_Brake();
+    HAL_Delay(PAUSE_BEFORE_TURN_MS);
+
+    if (direction > 0) {
+        Motor_Set(-TURN_PWM_PERCENT, TURN_PWM_PERCENT);  /* Izquierda */
+    } else {
+        Motor_Set(TURN_PWM_PERCENT, -TURN_PWM_PERCENT);  /* Derecha */
+    }
+
+    HAL_Delay(turn_ms);
 
     Motor_Brake();
     HAL_Delay(PAUSE_AFTER_TURN_MS); /* Pausa visible al terminar de girar */
 }
 
-/* ================= BUCLE PRINCIPAL DEL POLÍGONO ================= */
-static void Polygon_Run(uint8_t sides, float side_cm, int8_t direction)
+/* ================= BUCLE PRINCIPAL DEL POLÍGONO (con vueltas) ================= */
+static void Polygon_Run(uint8_t sides, uint8_t laps, float side_cm, int8_t direction)
 {
-    for (uint8_t i = 0U; i < sides; i++) {
-        // 1. Avanzar el tramo recto y parar
+    if (sides < 3U || laps == 0U || side_cm <= 0.0f) {
+        return; /* Invalid configuration */
+    }
+
+    const float    turn_deg    = 360.0f / (float)sides;   /* Triangle: 120°, Square: 90° */
+    const uint16_t total_sides = (uint16_t)sides * (uint16_t)laps;
+
+    for (uint16_t i = 0U; i < total_sides; i++) {
+        /* 1. Advance one straight side and stop */
         Drive_Straight(side_cm);
 
-        // Si es el último lado, rompemos para cerrar el polígono sin girar de más
-        if (i == (sides - 1U)) {
+        /* Last side of the last lap: stop without an extra turn */
+        if (i == (total_sides - 1U)) {
             break;
         }
 
-        // 2. Girar 90° y parar
-        Turn_Once(direction);
+        /* 2. Turn the polygon's exterior angle and stop
+         *    (this includes the turn between laps, so lap 2 starts aligned) */
+        Turn_Angle(direction, turn_deg);
     }
+
     Motor_Brake();
 }
 
+/* ================= MAIN ================= */
 int main(void)
 {
     HAL_Init();
@@ -287,8 +341,7 @@ int main(void)
         if (run_request != 0U) {
             run_request = 0U;
 
-            /* Ejecuta la secuencia completa en bucle por cada lado del polígono */
-            Polygon_Run(polygon_sides, polygon_side_cm, polygon_turn_direction);
+            Polygon_Run(polygon_sides, polygon_laps, polygon_side_cm, polygon_turn_direction);
 
             Motor_Brake();
         }
@@ -296,6 +349,7 @@ int main(void)
     }
 }
 
+/* ================= Encoder interrupt ================= */
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance != TIM2) return;
@@ -309,6 +363,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
     }
 }
 
+/* ================= Peripheral configuration (unchanged) ================= */
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
