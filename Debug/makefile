@@ -34,34 +34,34 @@ $(wildcard ../makefile.init) \
 $(wildcard ../makefile.targets) \
 
 
-BUILD_ARTIFACT_NAME := MPEI81_LAB_4
+BUILD_ARTIFACT_NAME := AAA
 BUILD_ARTIFACT_EXTENSION := elf
 BUILD_ARTIFACT_PREFIX :=
 BUILD_ARTIFACT := $(BUILD_ARTIFACT_PREFIX)$(BUILD_ARTIFACT_NAME)$(if $(BUILD_ARTIFACT_EXTENSION),.$(BUILD_ARTIFACT_EXTENSION),)
 
 # Add inputs and outputs from these tool invocations to the build variables 
 EXECUTABLES += \
-MPEI81_LAB_4.elf \
+AAA.elf \
 
 MAP_FILES += \
-MPEI81_LAB_4.map \
+AAA.map \
 
 SIZE_OUTPUT += \
 default.size.stdout \
 
 OBJDUMP_LIST += \
-MPEI81_LAB_4.list \
+AAA.list \
 
 
 # All Target
 all: main-build
 
 # Main-build Target
-main-build: MPEI81_LAB_4.elf secondary-outputs
+main-build: AAA.elf secondary-outputs
 
 # Tool invocations
-MPEI81_LAB_4.elf MPEI81_LAB_4.map: $(OBJS) $(USER_OBJS) C:\Users\User\STM32CubeIDE\workspace_2.2.0\MPEI81_LAB_4\STM32F103C6TX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "MPEI81_LAB_4.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"C:\Users\User\STM32CubeIDE\workspace_2.2.0\MPEI81_LAB_4\STM32F103C6TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="MPEI81_LAB_4.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+AAA.elf AAA.map: $(OBJS) $(USER_OBJS) C:\Users\User\STM32CubeIDE\workspace_2.2.0\AAA\STM32F103C6TX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "AAA.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"C:\Users\User\STM32CubeIDE\workspace_2.2.0\AAA\STM32F103C6TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="AAA.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 
@@ -70,14 +70,14 @@ default.size.stdout: $(EXECUTABLES) makefile objects.list $(OPTIONAL_TOOL_DEPS)
 	@echo 'Finished building: $@'
 	@echo ' '
 
-MPEI81_LAB_4.list: $(EXECUTABLES) makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-objdump -h -S $(EXECUTABLES) > "MPEI81_LAB_4.list"
+AAA.list: $(EXECUTABLES) makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-objdump -h -S $(EXECUTABLES) > "AAA.list"
 	@echo 'Finished building: $@'
 	@echo ' '
 
 # Other Targets
 clean:
-	-$(RM) MPEI81_LAB_4.elf MPEI81_LAB_4.list MPEI81_LAB_4.map default.size.stdout
+	-$(RM) AAA.elf AAA.list AAA.map default.size.stdout
 	-@echo ' '
 
 secondary-outputs: $(SIZE_OUTPUT) $(OBJDUMP_LIST)

@@ -59,24 +59,24 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define PWMA_Pin GPIO_PIN_0
-#define PWMA_GPIO_Port GPIOA
-#define AIN2_Pin GPIO_PIN_5
-#define AIN2_GPIO_Port GPIOA
-#define AIN1_Pin GPIO_PIN_6
-#define AIN1_GPIO_Port GPIOA
-#define STBY_Pin GPIO_PIN_7
+#define STBY_Pin GPIO_PIN_5
 #define STBY_GPIO_Port GPIOA
-#define BIN1_Pin GPIO_PIN_0
+#define PWMA_Pin GPIO_PIN_6
+#define PWMA_GPIO_Port GPIOA
+#define PWMB_Pin GPIO_PIN_7
+#define PWMB_GPIO_Port GPIOA
+#define AIN1_Pin GPIO_PIN_12
+#define AIN1_GPIO_Port GPIOB
+#define AIN2_Pin GPIO_PIN_13
+#define AIN2_GPIO_Port GPIOB
+#define BIN1_Pin GPIO_PIN_14
 #define BIN1_GPIO_Port GPIOB
-#define BIN2_Pin GPIO_PIN_1
+#define BIN2_Pin GPIO_PIN_15
 #define BIN2_GPIO_Port GPIOB
-#define PWMB_Pin GPIO_PIN_10
-#define PWMB_GPIO_Port GPIOB
-#define ENC_I_Pin GPIO_PIN_8
+#define ENC_I_Pin GPIO_PIN_15
 #define ENC_I_GPIO_Port GPIOA
-#define ENC_D_Pin GPIO_PIN_10
-#define ENC_D_GPIO_Port GPIOA
+#define ENC_D_Pin GPIO_PIN_3
+#define ENC_D_GPIO_Port GPIOB
 #define SCL_Pin GPIO_PIN_6
 #define SCL_GPIO_Port GPIOB
 #define SDA_Pin GPIO_PIN_7

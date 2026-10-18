@@ -14,17 +14,6 @@
   * If no LICENSE file comes with this software, it is provided AS-IS.
   *
   ******************************************************************************
-  *
-  * Polygon car (STM32F103C6, 72 MHz):
-  *   - TB6612FNG : PWMA = TIM2_CH1 (PA0), PWMB = TIM2_CH3 (PB10), 20 kHz
-  *                 AIN1, AIN2, BIN1, BIN2, STBY = GPIO outputs
-  *   - HC-020K   : ENC_I = TIM1_CH1 (PA8), ENC_D = TIM1_CH3 (PA10)
-  *                 input capture, 10 us resolution -> speed from pulse period
-  *   - MPU6050   : SCL / SDA, bit-banged I2C (open drain)
-  *
-  * Main loop at 200 Hz: gyro integration, per-wheel speed PI, heading hold,
-  * in-place turns with the gyro.
-  ******************************************************************************
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
@@ -33,653 +22,416 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdint.h>
-#include <stdbool.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-typedef struct
-{
-  GPIO_TypeDef *in1_port;  uint16_t in1_pin;
-  GPIO_TypeDef *in2_port;  uint16_t in2_pin;
-  uint32_t      channel;   /* TIM2 channel */
-} Motor_t;
+typedef enum { MOTOR_L = 0, MOTOR_R = 1 } Motor_t;
 
-typedef struct
-{
-  volatile int32_t  pulses;    /* rising edges counted                 */
-  volatile uint16_t last_cap;  /* last captured TIM1 value             */
-  volatile uint16_t period;    /* TIM1 ticks between pulses, 0 = none  */
-  volatile uint32_t last_ms;   /* HAL_GetTick() of the last pulse      */
-  volatile uint8_t  seen;      /* at least one pulse received          */
+/* One HC020K encoder on a TIM2 input-capture channel, both edges */
+typedef struct {
+  volatile uint32_t t1, t2, t3;  /* absolute times of the last 3 edges [10 us] */
+  volatile uint8_t  n;           /* valid edges stored (0..3)                  */
+  volatile int32_t  count;       /* signed edge count (odometry)               */
+  volatile int8_t   dir;         /* last commanded direction: +1 / -1          */
 } Encoder_t;
+
+typedef struct { float integ; } SpeedPI_t;
+
+typedef enum {
+  ST_IDLE = 0,
+  ST_STRAIGHT,
+  ST_PAUSE_AFTER_STRAIGHT,
+  ST_TURN,
+  ST_PAUSE_AFTER_TURN,
+  ST_DONE
+} State_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-/* ---------------- Polygon (defaults, can be changed at runtime) ---------- */
-#define DEFAULT_SIDES            4
-#define DEFAULT_SIDE_LENGTH_CM   50.0f
-#define TURN_DIRECTION           (+1.0f)   /* +1 = turn left (CCW), -1 = right */
+/* ---------- Polygon defaults (the variables below can be edited) ---------- */
+#define DEFAULT_SIDE_CM      100.0f   /* side length [cm]                   */
+#define DEFAULT_SIDES        4       /* number of sides (>= 3)             */
+#define DEFAULT_LAPS         1       /* number of laps (>= 1)              */
 
-/* ---------------- Mechanics ---------------------------------------------- */
-#define PI_F                3.14159265f
-#define WHEEL_DIAMETER_CM   6.2f
-#define ENCODER_SLOTS       20U            /* HC-020K disk, rising edges only  */
-#define CM_PER_PULSE        ((PI_F * WHEEL_DIAMETER_CM) / (float)ENCODER_SLOTS)  /* 0.974 cm */
+/* ---------- Mechanics ---------- */
+#define WHEEL_DIAM_CM        6.2f
+#define ENC_SLOTS            20.0f
+#define CM_PER_SLOT          (3.14159265f * WHEEL_DIAM_CM / ENC_SLOTS) /* ~0.974 cm */
+#define CM_PER_EDGE          (CM_PER_SLOT * 0.5f)                      /* ~0.487 cm */
+#define TRACK_WIDTH_CM       23.0f   /* MEASURE IT: center to center of the wheels */
+#define RAD2DEG              57.2957795f
 
-/* ---------------- Wiring / orientation ----------------------------------- */
-#define LEFT_MOTOR_IS_A     1              /* 1: A = left, B = right           */
-#define INVERT_LEFT         0              /* 1 if left wheel spins backwards  */
-#define INVERT_RIGHT        0
-#define GYRO_SIGN           (+1.0f)        /* yaw must INCREASE on a left turn */
+/* ---------- TIM2: 10 us ticks, overflow every 10 ms ---------- */
+#define ENC_TICK_HZ          100000.0f
+#define ENC_TICKS_PER_OVF    1000u
+#define LOOP_DT              0.01f
+#define ENC_TIMEOUT_TICKS    30000u  /* 300 ms without edges -> speed 0    */
+#define ENC_MIN_EDGE_TICKS   100u    /* < 1 ms between edges = glitch      */
+#define ENC_IC_FILTER        15      /* max hardware input filter          */
 
-/* ---------------- Encoders (TIM1: 72 MHz / 720 = 100 kHz) ---------------- */
-#define TIM1_TICK_S         10.0e-6f       /* 10 us per TIM1 count             */
-#define ENC_MIN_PERIOD      200U           /* 2 ms: shorter = noise, ignored   */
-#define ENC_FRESH_MS        600U           /* < 655 ms TIM1 overflow time      */
-#define ENC_STOP_MS         400U           /* no pulse for this long = stopped */
-#define ENC_IC_FILTER       15U            /* input capture digital filter     */
+/* ---------- Motors (TB6612FNG) ---------- */
+#define PWM_MAX              3599
+#define MOTOR_L_INVERT       0
+#define MOTOR_R_INVERT       0
 
-/* ---------------- Control ------------------------------------------------ */
-#define CONTROL_PERIOD_MS   5U             /* 200 Hz control loop              */
-#define CONTROL_DT_S        (CONTROL_PERIOD_MS / 1000.0f)
+/* ---------- Trajectory ---------- */
+#define START_DELAY_MS       2000
+#define TURN_DIR             1.0f    /* +1 = turn left (CCW), -1 = right   */
+#define V_CRUISE             30.0f   /* cm/s                               */
+#define V_MIN                12.0f
+#define ACCEL                30.0f   /* cm/s^2                             */
+#define SLOW_DIST            10.0f   /* cm                                 */
+#define PAUSE_S              0.4f
 
-#define CRUISE_SPEED_CMS    25.0f
-#define MIN_SPEED_CMS       8.0f
-#define ACCEL_CMS2          40.0f
-#define DECEL_DIST_CM       10.0f
-#define BRAKE_COMP_CM       0.5f           /* stop this much early (coasting)  */
+/* ---------- Wheel speed PI ---------- */
+#define PWM_DEADZONE         1500.0f  /* PWM to start moving straight       */
+#define TURN_PWM_DEADZONE    1200.0f /* turning in place needs more        */
+#define KFF                  60.0f
+#define KP_V                 40.0f
+#define KI_V                 150.0f
+#define I_MAX                10.0f
 
-#define PWM_DEADZONE        25.0f          /* % needed to start moving         */
-#define PWM_PER_CMS         1.2f           /* feed-forward % per cm/s          */
-#define PWM_MAX_STRAIGHT    95.0f
+/* ---------- Heading hold on straights (odometry) ---------- */
+#define KH                   1.0f    /* cm/s per degree                    */
+#define H_CORR_MAX           6.0f
 
-#define SPEED_KP            1.5f           /* % per cm/s                       */
-#define SPEED_KI            4.0f           /* % per (cm/s * s)                 */
-#define SPEED_I_LIMIT       25.0f          /* max integral contribution (%)    */
+/* ---------- In-place turn (odometry) ---------- */
+#define TURN_K               0.25f    /* cm/s per degree remaining          */
+#define V_TURN_MAX           5.0f
+#define V_TURN_MIN           2.0f
+#define TURN_STOP_DEG        10.0f    /* stop this early to absorb coasting */
+#define TURN_TIMEOUT_S       5.0f
 
-#define HEAD_KP             0.8f           /* cm/s per degree                  */
-#define HEAD_KD             0.02f          /* cm/s per deg/s                   */
-#define HEAD_CORR_MAX       10.0f          /* cm/s                             */
-
-#define TURN_KP             1.2f           /* % per degree                     */
-#define TURN_KD             0.15f          /* % per deg/s                      */
-#define TURN_PWM_MIN        28.0f
-#define TURN_PWM_MAX        55.0f
-#define TURN_TOL_DEG        1.0f
-#define TURN_RATE_TOL_DPS   5.0f
-#define TURN_TIMEOUT_MS     5000U
-
-#define SETTLE_MS           300U
-
-/* ---------------- MPU6050 ------------------------------------------------ */
-#define MPU_ADDR            0x68U          /* AD0 = GND                        */
-#define MPU_SMPLRT_DIV      0x19U
-#define MPU_CONFIG          0x1AU
-#define MPU_GYRO_CONFIG     0x1BU
-#define MPU_ACCEL_CONFIG    0x1CU
-#define MPU_GYRO_ZOUT_H     0x47U
-#define MPU_PWR_MGMT_1      0x6BU
-#define MPU_WHO_AM_I        0x75U
-
-#define GYRO_LSB_PER_DPS    65.5f          /* +-500 dps range                  */
-#define CALIB_SAMPLES       1000U
-#define CALIB_MAX_RANGE     150            /* LSB; larger = car was moving     */
-#define CALIB_RETRIES       5U
-
-/* ---------------- Bit-banged I2C ----------------------------------------- */
-#define I2C_HALF_US         4U             /* ~100 kHz                         */
-
+/* ---------- Diagnostics ---------- */
+#define DIAG_MOTOR_TEST      0             /* 1 = spin both wheels 1 s at power-on */
+#define DIAG_LED_PORT        GPIOC
+#define DIAG_LED_PIN         GPIO_PIN_13   /* Blue Pill LED, active low */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-#define SCL_H()      (SCL_GPIO_Port->BSRR = SCL_Pin)
-#define SCL_L()      (SCL_GPIO_Port->BRR  = SCL_Pin)
-#define SDA_H()      (SDA_GPIO_Port->BSRR = SDA_Pin)
-#define SDA_L()      (SDA_GPIO_Port->BRR  = SDA_Pin)
-#define SDA_READ()   ((SDA_GPIO_Port->IDR & SDA_Pin) != 0U)
-#define I2C_DELAY()  delay_us(I2C_HALF_US)
 
-#define ABSF(x)      (((x) < 0.0f) ? -(x) : (x))
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim3;
 
 /* USER CODE BEGIN PV */
-static const Motor_t motorA = { AIN1_GPIO_Port, AIN1_Pin,
-                                AIN2_GPIO_Port, AIN2_Pin, TIM_CHANNEL_1 };
-static const Motor_t motorB = { BIN1_GPIO_Port, BIN1_Pin,
-                                BIN2_GPIO_Port, BIN2_Pin, TIM_CHANNEL_3 };
+volatile float   side_length_cm = DEFAULT_SIDE_CM;
+volatile uint8_t num_sides      = DEFAULT_SIDES;
+volatile uint8_t num_laps       = DEFAULT_LAPS;
 
-#if LEFT_MOTOR_IS_A
-static const Motor_t * const mL = &motorA;
-static const Motor_t * const mR = &motorB;
-#else
-static const Motor_t * const mL = &motorB;
-static const Motor_t * const mR = &motorA;
-#endif
+volatile uint8_t diag_stage = 0;
 
-static Encoder_t encL = {0};   /* ENC_I, TIM1_CH1 */
-static Encoder_t encR = {0};   /* ENC_D, TIM1_CH3 */
+static Encoder_t enc_l = { .dir = 1 };   /* TIM2_CH1 (PA15) */
+static Encoder_t enc_r = { .dir = 1 };   /* TIM2_CH2 (PB3)  */
+static volatile uint32_t tim2_ovf = 0;   /* TIM2 overflows since start */
+static volatile uint32_t loop_ticks = 0;
 
-/* Visible in Live Expressions */
-volatile float yaw_deg     = 0.0f;
-volatile float yaw_rate    = 0.0f;
-volatile float speed_left  = 0.0f;   /* cm/s */
-volatile float speed_right = 0.0f;   /* cm/s */
-static float   gyro_bias   = 0.0f;
-static uint32_t last_gyro_cyc = 0;
+/* Globals so they can be watched live in the debugger */
+float dist_l = 0.0f, dist_r = 0.0f;      /* signed wheel travel [cm] */
+float heading_deg = 0.0f;                /* odometry heading, CCW + */
+float speed_l = 0.0f, speed_r = 0.0f;    /* wheel speed magnitude [cm/s] */
+float heading_target = 0.0f;
+State_t state = ST_IDLE;
 
-/* Polygon parameters: change them in the debugger and set run_request = 1 */
-volatile uint8_t polygon_sides   = DEFAULT_SIDES;
-volatile float   polygon_side_cm = DEFAULT_SIDE_LENGTH_CM;
-volatile uint8_t run_request     = 0;
-
-static uint32_t next_tick = 0;
+static SpeedPI_t pi_l, pi_r;
+static float     state_time = 0.0f;
+static float     v_ramp = 0.0f;
+static float     side_len = DEFAULT_SIDE_CM;
+static float     ext_angle = 90.0f;
+static uint16_t  total_sides = 0;
+static uint16_t  side_idx = 0;
+static float     side_start_l = 0.0f, side_start_r = 0.0f;
+static float     turn_sign = 1.0f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
+static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
-static void DWT_Init(void);
-static void delay_us(uint32_t us);
-
-static void Motors_Init(void);
-static void Motor_Set(float left, float right);
-static void Motor_Brake(void);
-
-static void  Encoders_Init(void);
-static float Enc_Speed(const Encoder_t *e);
-
-static void i2c_bus_recover(void);
-static bool MPU_Write(uint8_t reg, uint8_t val);
-static bool MPU_Read(uint8_t reg, uint8_t *buf, uint8_t len);
-static bool MPU_Init(void);
-static bool MPU_ReadGyroZ(int16_t *gz);
-static void MPU_Calibrate(void);
-static void Gyro_Update(void);
-
-static void Control_Start(void);
-static void Control_WaitTick(void);
-static void Settle(uint32_t ms);
-static void Drive_Straight(float dist_cm, float heading_ref);
-static void Turn_To(float heading_ref);
-static void Polygon_Run(uint8_t sides, float side_cm);
+static void  motor_set(Motor_t m, int32_t pwm);
+static void  motors_brake(void);
+static float encoder_speed(Encoder_t *e);
+static int32_t speed_pi(SpeedPI_t *c, float target, float meas, float dt, float deadzone);
+static void  update_odometry(void);
+static void  enter_state(State_t s);
+static void  start_side(void);
+static void  control_step(float dt);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/* ======================= Timing (DWT cycle counter) ======================= */
-static void DWT_Init(void)
-{
-  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-  DWT->CYCCNT = 0;
-  DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
-}
+static inline float absf(float x) { return (x < 0.0f) ? -x : x; }
 
-static void delay_us(uint32_t us)
-{
-  uint32_t start = DWT->CYCCNT;
-  uint32_t n = us * (SystemCoreClock / 1000000U);
-  while ((DWT->CYCCNT - start) < n) { }
-}
-
-static float clampf(float x, float lo, float hi)
+static inline float clampf(float x, float lo, float hi)
 {
   if (x < lo) return lo;
   if (x > hi) return hi;
   return x;
 }
 
-/* ======================= Motors: TB6612FNG + TIM2 PWM ===================== */
-static void Motor_Drive(const Motor_t *m, float pct)
+/* ===================== Time base (TIM2) ===================== */
+
+/* Absolute time [10 us ticks] of a TIM2 count value.
+   Must be called from the TIM2 ISR or with interrupts disabled.
+   If the counter already wrapped but the update IRQ is still pending,
+   that overflow is added here. */
+static inline uint32_t tim2_abs(uint32_t cnt)
 {
-  pct = clampf(pct, -100.0f, 100.0f);
+  uint32_t ovf = tim2_ovf;
+  if (__HAL_TIM_GET_FLAG(&htim2, TIM_FLAG_UPDATE) && cnt < (ENC_TICKS_PER_OVF / 2u)) ovf++;
+  return ovf * ENC_TICKS_PER_OVF + cnt;
+}
 
-  uint32_t top = __HAL_TIM_GET_AUTORELOAD(&htim2) + 1U;   /* 3600 */
-  uint32_t ccr = (uint32_t)((ABSF(pct) * (float)top) / 100.0f);
+/* ===================== Motors (TB6612FNG) ===================== */
 
-  if (pct > 0.0f)           /* forward: IN1 = H, IN2 = L */
+/* pwm in [-PWM_MAX, PWM_MAX]; positive = forward, 0 = coast */
+static void motor_set(Motor_t m, int32_t pwm)
+{
+  if (pwm > PWM_MAX)  pwm = PWM_MAX;
+  if (pwm < -PWM_MAX) pwm = -PWM_MAX;
+
+  /* remember the logical direction so encoder edges get the right sign */
+  Encoder_t *e = (m == MOTOR_L) ? &enc_l : &enc_r;
+  if (pwm > 0) e->dir = 1;
+  else if (pwm < 0) e->dir = -1;
+
+  if ((m == MOTOR_L && MOTOR_L_INVERT) || (m == MOTOR_R && MOTOR_R_INVERT)) pwm = -pwm;
+
+  GPIO_PinState in1 = (pwm > 0) ? GPIO_PIN_SET : GPIO_PIN_RESET;
+  GPIO_PinState in2 = (pwm < 0) ? GPIO_PIN_SET : GPIO_PIN_RESET;
+  uint32_t duty = (pwm >= 0) ? (uint32_t)pwm : (uint32_t)(-pwm);
+
+  if (m == MOTOR_L)
   {
-    HAL_GPIO_WritePin(m->in2_port, m->in2_pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(m->in1_port, m->in1_pin, GPIO_PIN_SET);
-  }
-  else if (pct < 0.0f)      /* reverse: IN1 = L, IN2 = H */
-  {
-    HAL_GPIO_WritePin(m->in1_port, m->in1_pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(m->in2_port, m->in2_pin, GPIO_PIN_SET);
-  }
-  else                      /* short brake: IN1 = H, IN2 = H */
-  {
-    ccr = 0;
-    HAL_GPIO_WritePin(m->in1_port, m->in1_pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(m->in2_port, m->in2_pin, GPIO_PIN_SET);
-  }
-  __HAL_TIM_SET_COMPARE(&htim2, m->channel, ccr);
-}
-
-/* left/right in percent, -100..100 (positive = forward) */
-static void Motor_Set(float left, float right)
-{
-#if INVERT_LEFT
-  left = -left;
-#endif
-#if INVERT_RIGHT
-  right = -right;
-#endif
-  Motor_Drive(mL, left);
-  Motor_Drive(mR, right);
-}
-
-static void Motor_Brake(void)
-{
-  Motor_Set(0.0f, 0.0f);
-}
-
-static void Motors_Init(void)
-{
-  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0);
-  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 0);
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
-  Motor_Brake();
-  HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_SET);   /* enable driver */
-}
-
-/* ======================= Encoders: TIM1 input capture ===================== */
-static void Encoders_Init(void)
-{
-  HAL_TIM_IC_Start_IT(&htim1, TIM_CHANNEL_1);
-  HAL_TIM_IC_Start_IT(&htim1, TIM_CHANNEL_3);
-}
-
-/* Called from the capture interrupt for every rising edge */
-static void Enc_OnCapture(Encoder_t *e, uint16_t cap)
-{
-  uint32_t now = HAL_GetTick();
-
-  if (e->seen && (now - e->last_ms) < ENC_FRESH_MS)
-  {
-    uint16_t dt = (uint16_t)(cap - e->last_cap);   /* wraps correctly */
-    if (dt < ENC_MIN_PERIOD)
-    {
-      return;                                      /* glitch, ignore */
-    }
-    e->period = dt;
+    HAL_GPIO_WritePin(AIN1_GPIO_Port, AIN1_Pin, in1);
+    HAL_GPIO_WritePin(AIN2_GPIO_Port, AIN2_Pin, in2);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, duty);
   }
   else
   {
-    e->period = 0;                                 /* first pulse after a stop */
+    HAL_GPIO_WritePin(BIN1_GPIO_Port, BIN1_Pin, in1);
+    HAL_GPIO_WritePin(BIN2_GPIO_Port, BIN2_Pin, in2);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, duty);
   }
-
-  e->last_cap = cap;
-  e->last_ms  = now;
-  e->seen     = 1;
-  e->pulses++;
 }
 
-/* Wheel speed in cm/s (magnitude) */
-static float Enc_Speed(const Encoder_t *e)
+/* IN1 = IN2 = H -> short brake. Direction is kept: while the wheel
+   coasts to a stop, its edges are still counted the right way. */
+static void motors_brake(void)
 {
+  HAL_GPIO_WritePin(AIN1_GPIO_Port, AIN1_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(AIN2_GPIO_Port, AIN2_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(BIN1_GPIO_Port, BIN1_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(BIN2_GPIO_Port, BIN2_Pin, GPIO_PIN_SET);
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
+}
+
+/* ===================== Encoders ===================== */
+
+/* Called from the TIM2 capture ISR on every edge (rising or falling) */
+static void enc_edge(Encoder_t *e, uint32_t cap, uint32_t ccer_pol_bit)
+{
+  uint32_t t = tim2_abs(cap);
+
+  /* Too close to the previous edge: comparator chatter. Ignore it and
+     keep waiting for the same polarity. */
+  if (e->n >= 1 && (t - e->t1) < ENC_MIN_EDGE_TICKS) return;
+
+  e->t3 = e->t2;
+  e->t2 = e->t1;
+  e->t1 = t;
+  if (e->n < 3) e->n++;
+  e->count += e->dir;
+
+  /* F1 timers cannot capture both edges: flip the polarity by hand */
+  htim2.Instance->CCER ^= ccer_pol_bit;
+}
+
+/* Wheel speed magnitude [cm/s]. Uses a full slot period (3 edges)
+   so the uneven duty cycle of the HC020K does not matter. */
+static float encoder_speed(Encoder_t *e)
+{
+  uint32_t t1, t3, now;
+  uint8_t  n;
+
   __disable_irq();
-  uint16_t per  = e->period;
-  uint32_t last = e->last_ms;
-  uint8_t  seen = e->seen;
+  now = tim2_abs(__HAL_TIM_GET_COUNTER(&htim2));
+  n  = e->n;
+  t1 = e->t1;
+  t3 = e->t3;
+  if (n > 0 && (now - t1) > ENC_TIMEOUT_TICKS) { e->n = 0; n = 0; }
   __enable_irq();
 
-  uint32_t age = HAL_GetTick() - last;
-  if (!seen || per == 0U || age > ENC_STOP_MS)
+  if (n < 3) return 0.0f;
+
+  uint32_t period = t1 - t3;
+  uint32_t est = 2u * (now - t1);      /* wheel slowing down: decay estimate */
+  if (est > period) period = est;
+  if (period == 0) return 0.0f;
+
+  return CM_PER_SLOT * ENC_TICK_HZ / (float)period;
+}
+
+/* Wheel distances and heading from the signed edge counts */
+static void update_odometry(void)
+{
+  int32_t cl = enc_l.count;   /* 32-bit reads are atomic on Cortex-M3 */
+  int32_t cr = enc_r.count;
+  dist_l = (float)cl * CM_PER_EDGE;
+  dist_r = (float)cr * CM_PER_EDGE;
+  heading_deg = (dist_r - dist_l) / TRACK_WIDTH_CM * RAD2DEG;
+}
+
+/* ===================== Controllers ===================== */
+
+/* Speed-magnitude PI with feed-forward. Returns PWM counts (>= 0). */
+static int32_t speed_pi(SpeedPI_t *c, float target, float meas, float dt, float deadzone)
+{
+  if (target <= 0.0f) { c->integ = 0.0f; return 0; }
+
+  float e = target - meas;
+  c->integ = clampf(c->integ + e * dt, -I_MAX, I_MAX);
+
+  float u = deadzone + KFF * target + KP_V * e + KI_V * c->integ;
+  return (int32_t)clampf(u, 0.0f, (float)PWM_MAX);
+}
+
+static void enter_state(State_t s)
+{
+  state = s;
+  state_time = 0.0f;
+}
+
+static void start_side(void)
+{
+  heading_target = (float)side_idx * ext_angle * TURN_DIR;
+  side_start_l = dist_l;
+  side_start_r = dist_r;
+  pi_l.integ = 0.0f;
+  pi_r.integ = 0.0f;
+  v_ramp = V_MIN;
+  enter_state(ST_STRAIGHT);
+}
+
+/* Runs every 10 ms from the main loop */
+static void control_step(float dt)
+{
+  update_odometry();
+  speed_l = encoder_speed(&enc_l);
+  speed_r = encoder_speed(&enc_r);
+
+  state_time += dt;
+
+  switch (state)
   {
-    return 0.0f;
-  }
-
-  float v = CM_PER_PULSE / ((float)per * TIM1_TICK_S);
-
-  /* if no pulse arrived for longer than the last period, the wheel is slowing */
-  if (age > 0U)
-  {
-    float v_max = CM_PER_PULSE * 1000.0f / (float)age;
-    if (v_max < v) v = v_max;
-  }
-  return v;
-}
-
-/* ======================= Bit-banged I2C =================================== */
-static void i2c_start(void)
-{
-  SDA_H(); I2C_DELAY();
-  SCL_H(); I2C_DELAY();
-  SDA_L(); I2C_DELAY();
-  SCL_L(); I2C_DELAY();
-}
-
-static void i2c_stop(void)
-{
-  SDA_L(); I2C_DELAY();
-  SCL_H(); I2C_DELAY();
-  SDA_H(); I2C_DELAY();
-}
-
-static bool i2c_write_byte(uint8_t b)
-{
-  for (uint8_t i = 0; i < 8U; i++)
-  {
-    if (b & 0x80U) SDA_H(); else SDA_L();
-    b <<= 1;
-    I2C_DELAY();
-    SCL_H(); I2C_DELAY();
-    SCL_L();
-  }
-  SDA_H();                     /* release SDA for ACK */
-  I2C_DELAY();
-  SCL_H(); I2C_DELAY();
-  bool ack = !SDA_READ();
-  SCL_L(); I2C_DELAY();
-  return ack;
-}
-
-static uint8_t i2c_read_byte(bool ack)
-{
-  uint8_t b = 0;
-  SDA_H();
-  for (uint8_t i = 0; i < 8U; i++)
-  {
-    b <<= 1;
-    I2C_DELAY();
-    SCL_H(); I2C_DELAY();
-    if (SDA_READ()) b |= 1U;
-    SCL_L();
-  }
-  if (ack) SDA_L(); else SDA_H();
-  I2C_DELAY();
-  SCL_H(); I2C_DELAY();
-  SCL_L();
-  SDA_H(); I2C_DELAY();
-  return b;
-}
-
-static void i2c_bus_recover(void)
-{
-  SDA_H();
-  for (uint8_t i = 0; i < 9U; i++)
-  {
-    SCL_L(); I2C_DELAY();
-    SCL_H(); I2C_DELAY();
-  }
-  i2c_stop();
-}
-
-/* ======================= MPU6050 ========================================== */
-static bool MPU_Write(uint8_t reg, uint8_t val)
-{
-  i2c_start();
-  if (!i2c_write_byte((uint8_t)(MPU_ADDR << 1))) goto fail;
-  if (!i2c_write_byte(reg))                      goto fail;
-  if (!i2c_write_byte(val))                      goto fail;
-  i2c_stop();
-  return true;
-fail:
-  i2c_stop();
-  return false;
-}
-
-static bool MPU_Read(uint8_t reg, uint8_t *buf, uint8_t len)
-{
-  i2c_start();
-  if (!i2c_write_byte((uint8_t)(MPU_ADDR << 1)))         goto fail;
-  if (!i2c_write_byte(reg))                              goto fail;
-  i2c_start();                                           /* repeated start */
-  if (!i2c_write_byte((uint8_t)((MPU_ADDR << 1) | 1U)))  goto fail;
-  while (len--)
-  {
-    *buf++ = i2c_read_byte(len > 0U);                    /* NACK last byte */
-  }
-  i2c_stop();
-  return true;
-fail:
-  i2c_stop();
-  return false;
-}
-
-static bool MPU_Init(void)
-{
-  uint8_t who = 0;
-
-  HAL_Delay(100);
-  i2c_bus_recover();
-
-  if (!MPU_Read(MPU_WHO_AM_I, &who, 1)) return false;    /* no ACK = not wired */
-  /* 0x68 on originals; clones may answer 0x70/0x72/0x98, so not checked */
-
-  if (!MPU_Write(MPU_PWR_MGMT_1, 0x80))   return false;  /* device reset       */
-  HAL_Delay(100);
-  if (!MPU_Write(MPU_PWR_MGMT_1, 0x01))   return false;  /* wake, PLL gyro X   */
-  HAL_Delay(10);
-  if (!MPU_Write(MPU_SMPLRT_DIV, 0x00))   return false;  /* 1 kHz              */
-  if (!MPU_Write(MPU_CONFIG, 0x03))       return false;  /* DLPF ~44 Hz        */
-  if (!MPU_Write(MPU_GYRO_CONFIG, 0x08))  return false;  /* +-500 dps          */
-  if (!MPU_Write(MPU_ACCEL_CONFIG, 0x00)) return false;  /* +-2 g              */
-  HAL_Delay(50);
-  return true;
-}
-
-static bool MPU_ReadGyroZ(int16_t *gz)
-{
-  uint8_t b[2];
-  if (!MPU_Read(MPU_GYRO_ZOUT_H, b, 2))
-  {
-    i2c_bus_recover();
-    return false;
-  }
-  *gz = (int16_t)(((uint16_t)b[0] << 8) | b[1]);
-  return true;
-}
-
-/* Car must be still. Repeats if movement is detected. */
-static void MPU_Calibrate(void)
-{
-  Motor_Brake();
-  HAL_Delay(1000);                         /* let vibrations die out */
-
-  for (uint8_t attempt = 0; attempt < CALIB_RETRIES; attempt++)
-  {
-    int32_t  sum = 0;
-    uint32_t ok  = 0;
-    int16_t  gz, gmin = 32767, gmax = -32768;
-
-    for (uint32_t i = 0; i < CALIB_SAMPLES; i++)
+    case ST_STRAIGHT:
     {
-      if (MPU_ReadGyroZ(&gz))
+      float dist = 0.5f * ((dist_l - side_start_l) + (dist_r - side_start_r));
+      float remaining = side_len - dist;
+
+      if (remaining <= 0.0f)
       {
-        sum += gz;
-        ok++;
-        if (gz < gmin) gmin = gz;
-        if (gz > gmax) gmax = gz;
+        motors_brake();
+        enter_state(ST_PAUSE_AFTER_STRAIGHT);
+        break;
       }
-      HAL_Delay(2);
-    }
 
-    if (ok > 0U)
-    {
-      gyro_bias = (float)sum / (float)ok;
-      if ((gmax - gmin) <= CALIB_MAX_RANGE)
+      v_ramp += ACCEL * dt;
+      if (v_ramp > V_CRUISE) v_ramp = V_CRUISE;
+      float v = v_ramp;
+      if (remaining < SLOW_DIST)
       {
-        break;                             /* good calibration */
+        float vs = V_MIN + (V_CRUISE - V_MIN) * (remaining / SLOW_DIST);
+        if (vs < v) v = vs;
       }
-    }
-  }
 
-  yaw_deg  = 0.0f;
-  yaw_rate = 0.0f;
-  last_gyro_cyc = DWT->CYCCNT;
-}
+      /* heading hold: positive error -> turn CCW -> right wheel faster */
+      float herr = heading_target - heading_deg;
+      float corr = clampf(KH * herr, -H_CORR_MAX, H_CORR_MAX);
 
-static void Gyro_Update(void)
-{
-  int16_t  gz;
-  uint32_t now = DWT->CYCCNT;
-  float    dt  = (float)(now - last_gyro_cyc) / (float)SystemCoreClock;
-  last_gyro_cyc = now;
-
-  if (MPU_ReadGyroZ(&gz))
-  {
-    yaw_rate = GYRO_SIGN * ((float)gz - gyro_bias) / GYRO_LSB_PER_DPS;
-  }
-  /* if the read failed, the previous rate is used for this step */
-  yaw_deg += yaw_rate * dt;
-}
-
-/* ======================= Control loop helpers ============================= */
-static void Control_Start(void)
-{
-  next_tick = HAL_GetTick() + CONTROL_PERIOD_MS;
-}
-
-static void Control_WaitTick(void)
-{
-  while ((int32_t)(HAL_GetTick() - next_tick) < 0) { }
-  next_tick += CONTROL_PERIOD_MS;
-  Gyro_Update();
-  speed_left  = Enc_Speed(&encL);
-  speed_right = Enc_Speed(&encR);
-}
-
-static void Settle(uint32_t ms)
-{
-  Motor_Brake();
-  Control_Start();
-  for (uint32_t t = 0; t < ms; t += CONTROL_PERIOD_MS)
-  {
-    Control_WaitTick();                   /* keep integrating the gyro */
-  }
-}
-
-/* Feed-forward: PWM needed for a given wheel speed */
-static float FeedForward(float v_cms)
-{
-  return (v_cms > 0.0f) ? (PWM_DEADZONE + PWM_PER_CMS * v_cms) : 0.0f;
-}
-
-/* ======================= Straight side ==================================== */
-static void Drive_Straight(float dist_cm, float heading_ref)
-{
-  const int32_t  l0 = encL.pulses;
-  const int32_t  r0 = encR.pulses;
-  const uint32_t timeout_ms = (uint32_t)(dist_cm / MIN_SPEED_CMS * 1000.0f) * 2U + 2000U;
-  const float    i_lim = SPEED_I_LIMIT / SPEED_KI;
-
-  float    iL = 0.0f, iR = 0.0f;
-  uint32_t t_ms = 0;
-
-  Control_Start();
-  for (;;)
-  {
-    Control_WaitTick();
-    t_ms += CONTROL_PERIOD_MS;
-
-    int32_t sum       = (encL.pulses - l0) + (encR.pulses - r0);
-    float   traveled  = 0.5f * (float)sum * CM_PER_PULSE;
-    float   remaining = dist_cm - traveled;
-
-    if (remaining <= BRAKE_COMP_CM || t_ms > timeout_ms)
-    {
+      motor_set(MOTOR_L, speed_pi(&pi_l, v - corr, speed_l, dt, PWM_DEADZONE));
+      motor_set(MOTOR_R, speed_pi(&pi_r, v + corr, speed_r, dt, PWM_DEADZONE));
       break;
     }
 
-    /* speed profile: ramp up, cruise, ramp down */
-    float v_ref = MIN_SPEED_CMS + ACCEL_CMS2 * ((float)t_ms / 1000.0f);
-    if (v_ref > CRUISE_SPEED_CMS) v_ref = CRUISE_SPEED_CMS;
-    if (remaining < DECEL_DIST_CM)
+    case ST_PAUSE_AFTER_STRAIGHT:
+      motors_brake();
+      if (state_time >= PAUSE_S)
+      {
+        if (side_idx + 1 >= total_sides)
+        {
+          enter_state(ST_DONE);
+        }
+        else
+        {
+          update_odometry();
+          heading_target = (float)(side_idx + 1) * ext_angle * TURN_DIR;
+          turn_sign = (heading_target - heading_deg >= 0.0f) ? 1.0f : -1.0f;
+          pi_l.integ = 0.0f;
+          pi_r.integ = 0.0f;
+          enter_state(ST_TURN);
+        }
+      }
+      break;
+
+    case ST_TURN:
     {
-      float v_dec = MIN_SPEED_CMS + (CRUISE_SPEED_CMS - MIN_SPEED_CMS) * remaining / DECEL_DIST_CM;
-      if (v_dec < v_ref) v_ref = v_dec;
+      /* degrees still to go in the turning direction (negative = overshoot) */
+      float remaining = (heading_target - heading_deg) * turn_sign;
+
+      if (remaining <= TURN_STOP_DEG || state_time > TURN_TIMEOUT_S)
+      {
+        motors_brake();
+        enter_state(ST_PAUSE_AFTER_TURN);
+        break;
+      }
+
+      float v = clampf(TURN_K * remaining, V_TURN_MIN, V_TURN_MAX);
+      int32_t pl = speed_pi(&pi_l, v, speed_l, dt, TURN_PWM_DEADZONE);
+      int32_t pr = speed_pi(&pi_r, v, speed_r, dt, TURN_PWM_DEADZONE);
+
+      /* turn_sign > 0 -> CCW: left backward, right forward */
+      motor_set(MOTOR_L, (turn_sign > 0.0f) ? -pl :  pl);
+      motor_set(MOTOR_R, (turn_sign > 0.0f) ?  pr : -pr);
+      break;
     }
 
-    /* heading hold: yaw below reference -> car drifted right -> right wheel faster */
-    float herr = heading_ref - yaw_deg;
-    float corr = clampf(HEAD_KP * herr - HEAD_KD * yaw_rate, -HEAD_CORR_MAX, HEAD_CORR_MAX);
+    case ST_PAUSE_AFTER_TURN:
+      motors_brake();
+      if (state_time >= PAUSE_S)
+      {
+        side_idx++;
+        start_side();
+      }
+      break;
 
-    float refL = v_ref - corr;
-    float refR = v_ref + corr;
-    if (refL < 0.0f) refL = 0.0f;
-    if (refR < 0.0f) refR = 0.0f;
+    case ST_DONE:
+      motors_brake();
+      if (state_time >= PAUSE_S)
+      {
+        HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_RESET);
+      }
+      break;
 
-    /* per-wheel speed PI with feed-forward */
-    float eL = refL - speed_left;
-    float eR = refR - speed_right;
-    iL = clampf(iL + eL * CONTROL_DT_S, -i_lim, i_lim);
-    iR = clampf(iR + eR * CONTROL_DT_S, -i_lim, i_lim);
-
-    float pL = FeedForward(refL) + SPEED_KP * eL + SPEED_KI * iL;
-    float pR = FeedForward(refR) + SPEED_KP * eR + SPEED_KI * iR;
-
-    Motor_Set(clampf(pL, 0.0f, PWM_MAX_STRAIGHT),
-              clampf(pR, 0.0f, PWM_MAX_STRAIGHT));
+    case ST_IDLE:
+    default:
+      break;
   }
-  Motor_Brake();
-}
-
-/* ======================= Turn in place ==================================== */
-static void Turn_To(float heading_ref)
-{
-  uint8_t  in_tol = 0;
-  uint32_t t_ms   = 0;
-
-  Control_Start();
-  for (;;)
-  {
-    Control_WaitTick();
-    t_ms += CONTROL_PERIOD_MS;
-    if (t_ms > TURN_TIMEOUT_MS) break;
-
-    float err = heading_ref - yaw_deg;
-
-    if (ABSF(err) < TURN_TOL_DEG && ABSF(yaw_rate) < TURN_RATE_TOL_DPS)
-    {
-      Motor_Brake();
-      if (++in_tol >= 4U) break;          /* 20 ms stable on target */
-      continue;
-    }
-    in_tol = 0;
-
-    float cmd = TURN_KP * err - TURN_KD * yaw_rate;
-    float mag = clampf(ABSF(cmd), TURN_PWM_MIN, TURN_PWM_MAX);
-    float p   = (cmd >= 0.0f) ? mag : -mag;
-
-    /* p > 0 -> turn left (CCW): left wheel back, right wheel forward */
-    Motor_Set(-p, p);
-  }
-  Motor_Brake();
-}
-
-/* ======================= Polygon ========================================== */
-static void Polygon_Run(uint8_t sides, float side_cm)
-{
-  if (sides < 3U)       sides = 3U;
-  if (side_cm < 5.0f)   side_cm = 5.0f;
-
-  const float exterior = TURN_DIRECTION * 360.0f / (float)sides;
-  float heading = yaw_deg;                /* absolute reference: no error build-up */
-
-  for (uint8_t i = 0; i < sides; i++)
-  {
-    Drive_Straight(side_cm, heading);
-    Settle(SETTLE_MS);
-
-    heading += exterior;
-    Turn_To(heading);
-    Settle(SETTLE_MS);
-  }
-  Motor_Brake();
 }
 
 /* USER CODE END 0 */
@@ -713,35 +465,77 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_I2C1_Init();
   MX_TIM1_Init();
   MX_TIM2_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-  DWT_Init();
-  Motors_Init();
-  Encoders_Init();
 
-  if (!MPU_Init())
+  /* Motors off, driver in standby */
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+  motor_set(MOTOR_L, 0);
+  motor_set(MOTOR_R, 0);
+  HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_RESET);
+
+#if DIAG_MOTOR_TEST
+  HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_SET);
+  motor_set(MOTOR_L, 2000);
+  motor_set(MOTOR_R, 2000);
+  HAL_Delay(1000);
+  motors_brake();
+  HAL_Delay(300);
+  motor_set(MOTOR_L, 0);
+  motor_set(MOTOR_R, 0);
+  HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_RESET);
+#endif
+
+  /* Read the polygon parameters */
   {
-    Error_Handler();                      /* MPU6050 not answering: check wiring */
+    uint8_t sides = (num_sides < 3) ? 3 : num_sides;
+    uint8_t laps  = (num_laps  < 1) ? 1 : num_laps;
+    total_sides = (uint16_t)sides * laps;
+    ext_angle   = 360.0f / (float)sides;
+    side_len    = side_length_cm;
   }
 
-  run_request = 1;                        /* draw one polygon after power-up */
+  HAL_Delay(START_DELAY_MS);
+
+  /* Start the encoders and the 100 Hz loop */
+  diag_stage = 2;   /* timers failed to start -> 2 blinks */
+  __HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_UPDATE);
+  if (HAL_TIM_Base_Start_IT(&htim2) != HAL_OK)              Error_Handler();
+  if (HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
+  if (HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_2) != HAL_OK) Error_Handler();
+  diag_stage = 3;   /* running: LED blinks once per second */
+
+  /* Go */
+  HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_SET);
+  side_idx = 0;
+  start_side();
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    if (run_request)
-    {
-      MPU_Calibrate();                    /* keep the car still (~3 s) */
-      HAL_Delay(500);
-      Polygon_Run(polygon_sides, polygon_side_cm);
-      run_request = 0;
-    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    if (loop_ticks > 0)
+    {
+      __disable_irq();
+      uint32_t n = loop_ticks;
+      loop_ticks = 0;
+      __enable_irq();
+
+      control_step(LOOP_DT * (float)n);
+
+      /* Heartbeat: toggles every 0.5 s while the control loop runs */
+      static uint8_t hb = 0;
+      if (++hb >= 50) { hb = 0; HAL_GPIO_TogglePin(DIAG_LED_PORT, DIAG_LED_PIN); }
+    }
   }
   /* USER CODE END 3 */
 }
@@ -786,6 +580,40 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
   * @brief TIM1 Initialization Function
   * @param None
   * @retval None
@@ -799,7 +627,6 @@ static void MX_TIM1_Init(void)
 
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_IC_InitTypeDef sConfigIC = {0};
 
   /* USER CODE BEGIN TIM1_Init 1 */
 
@@ -820,40 +647,14 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_TIM_IC_Init(&htim1) != HAL_OK)
-  {
-    Error_Handler();
-  }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
   {
     Error_Handler();
   }
-  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
-  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
-  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
-  sConfigIC.ICFilter = 8;
-  if (HAL_TIM_IC_ConfigChannel(&htim1, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigIC.ICFilter = 0;
-  if (HAL_TIM_IC_ConfigChannel(&htim1, &sConfigIC, TIM_CHANNEL_3) != HAL_OK)
-  {
-    Error_Handler();
-  }
   /* USER CODE BEGIN TIM1_Init 2 */
-  /* Same (stronger) noise filter on both encoder channels */
-  sConfigIC.ICFilter = ENC_IC_FILTER;
-  if (HAL_TIM_IC_ConfigChannel(&htim1, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_IC_ConfigChannel(&htim1, &sConfigIC, TIM_CHANNEL_3) != HAL_OK)
-  {
-    Error_Handler();
-  }
+
   /* USER CODE END TIM1_Init 2 */
 
 }
@@ -872,15 +673,15 @@ static void MX_TIM2_Init(void)
 
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_IC_InitTypeDef sConfigIC = {0};
 
   /* USER CODE BEGIN TIM2_Init 1 */
 
   /* USER CODE END TIM2_Init 1 */
   htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 0;
+  htim2.Init.Prescaler = 719;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 3599;
+  htim2.Init.Period = 999;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
@@ -892,7 +693,7 @@ static void MX_TIM2_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
+  if (HAL_TIM_IC_Init(&htim2) != HAL_OK)
   {
     Error_Handler();
   }
@@ -902,22 +703,97 @@ static void MX_TIM2_Init(void)
   {
     Error_Handler();
   }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 0;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+  sConfigIC.ICFilter = 10;
+  if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  sConfigIC.ICFilter = 0;
+  if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_2) != HAL_OK)
   {
     Error_Handler();
   }
   /* USER CODE BEGIN TIM2_Init 2 */
-
+  /* Both channels: rising edge first, maximum input filter */
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICFilter = ENC_IC_FILTER;
+  if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE END TIM2_Init 2 */
-  HAL_TIM_MspPostInit(&htim2);
+
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 0;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 65535;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+  /* Period was generated as 65535 (~1.1 kHz): force 3599 -> 20 kHz */
+  htim3.Init.Period = PWM_MAX;
+  __HAL_TIM_SET_AUTORELOAD(&htim3, PWM_MAX);
+  /* USER CODE END TIM3_Init 2 */
+  HAL_TIM_MspPostInit(&htim3);
 
 }
 
@@ -939,68 +815,62 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, AIN2_Pin|AIN1_Pin|STBY_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, BIN1_Pin|BIN2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, AIN1_Pin|AIN2_Pin|BIN1_Pin|BIN2_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : AIN2_Pin AIN1_Pin STBY_Pin */
-  GPIO_InitStruct.Pin = AIN2_Pin|AIN1_Pin|STBY_Pin;
+  /*Configure GPIO pin : STBY_Pin */
+  GPIO_InitStruct.Pin = STBY_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  HAL_GPIO_Init(STBY_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : BIN1_Pin BIN2_Pin */
-  GPIO_InitStruct.Pin = BIN1_Pin|BIN2_Pin;
+  /*Configure GPIO pins : AIN1_Pin AIN2_Pin BIN1_Pin BIN2_Pin */
+  GPIO_InitStruct.Pin = AIN1_Pin|AIN2_Pin|BIN1_Pin|BIN2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : SCL_Pin SDA_Pin */
-  GPIO_InitStruct.Pin = SCL_Pin|SDA_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
-  /* I2C1 peripheral is not enabled, so SCL/SDA are switched to plain
-     open-drain outputs for the bit-banged I2C (GY-521 has pull-ups).
-     Released = high. */
-  SCL_GPIO_Port->BSRR = SCL_Pin;
-  SDA_GPIO_Port->BSRR = SDA_Pin;
-
-  GPIO_InitStruct.Pin   = SCL_Pin;
-  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_OD;
-  GPIO_InitStruct.Pull  = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-  HAL_GPIO_Init(SCL_GPIO_Port, &GPIO_InitStruct);
-
-  GPIO_InitStruct.Pin   = SDA_Pin;
-  HAL_GPIO_Init(SDA_GPIO_Port, &GPIO_InitStruct);
+  /* Diagnostic LED on PC13 (active low, start off) */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  HAL_GPIO_WritePin(DIAG_LED_PORT, DIAG_LED_PIN, GPIO_PIN_SET);
+  GPIO_InitStruct.Pin = DIAG_LED_PIN;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(DIAG_LED_PORT, &GPIO_InitStruct);
+  diag_stage = 1;   /* errors in peripheral init -> 1 blink */
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
 
-/* TIM1 input capture: one call per rising edge of an encoder.
-   Needs "TIM1 capture compare interrupt" enabled in CubeMX NVIC. */
+/* TIM2 update: every 10 ms -> control loop tick + time base */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM2)
+  {
+    tim2_ovf++;
+    loop_ticks++;
+  }
+}
+
+/* TIM2 capture: one HC020K edge */
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 {
-  if (htim->Instance != TIM1)
-  {
-    return;
-  }
+  if (htim->Instance != TIM2) return;
 
-  if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)          /* ENC_I, PA8 */
+  if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
   {
-    Enc_OnCapture(&encL, (uint16_t)HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1));
+    enc_edge(&enc_l, HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1), TIM_CCER_CC1P);
   }
-  else if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_3)     /* ENC_D, PA10 */
+  else if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2)
   {
-    Enc_OnCapture(&encR, (uint16_t)HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_3));
+    enc_edge(&enc_r, HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2), TIM_CCER_CC2P);
   }
 }
 
@@ -1013,13 +883,20 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
-  TIM2->CCR1 = 0;                                               /* PWM off    */
-  TIM2->CCR3 = 0;
-  HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_RESET);  /* driver off */
+  /* Put the driver in standby so the car never runs away on an error */
+  HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_RESET);
   __disable_irq();
+  /* Blink diag_stage times, then a long pause (busy-wait: SysTick is off) */
   while (1)
   {
+    for (uint8_t k = 0; k < diag_stage; k++)
+    {
+      DIAG_LED_PORT->BRR  = DIAG_LED_PIN;                  /* LED on  */
+      for (volatile uint32_t i = 0; i < 600000; i++) {}
+      DIAG_LED_PORT->BSRR = DIAG_LED_PIN;                  /* LED off */
+      for (volatile uint32_t i = 0; i < 600000; i++) {}
+    }
+    for (volatile uint32_t i = 0; i < 3000000; i++) {}
   }
   /* USER CODE END Error_Handler_Debug */
 }
